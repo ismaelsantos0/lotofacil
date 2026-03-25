@@ -108,8 +108,8 @@ class Analise:
 # =========================
 # LÓGICA
 # =========================
-def build_analysis(lookback: int = 5) -> Analise:
-    raw_concursos = fetch_latest_results(limit=lookback)
+async def build_analysis(lookback: int = 5) -> Analise:
+    raw_concursos = await fetch_latest_results(limit=lookback)
 
     concursos = [
         Concurso(numero=c.numero, data=c.data, dezenas=sorted(c.dezenas))
@@ -126,10 +126,7 @@ def build_analysis(lookback: int = 5) -> Analise:
             recency_score[dezena] += weight
 
     universo = list(range(1, 26))
-    ranking = sorted(
-        universo,
-        key=lambda n: (-freq[n], -recency_score[n], n)
-    )
+    ranking = sorted(universo, key=lambda n: (-freq[n], -recency_score[n], n))
 
     d1 = sorted(ranking[:10])
     d2 = sorted(ranking[10:15])
@@ -188,7 +185,7 @@ async def update_results_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     global LATEST_ANALYSIS
     try:
         logger.info("Atualizando resultados da Lotofácil...")
-        LATEST_ANALYSIS = build_analysis(lookback=DEFAULT_LOOKBACK)
+        LATEST_ANALYSIS = await build_analysis(lookback=DEFAULT_LOOKBACK)
         logger.info("Resultados atualizados com sucesso.")
     except Exception as e:
         logger.exception("Erro ao atualizar resultados: %s", e)
@@ -253,7 +250,7 @@ async def hoje_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         if LATEST_ANALYSIS is None:
-            LATEST_ANALYSIS = build_analysis(lookback=DEFAULT_LOOKBACK)
+            LATEST_ANALYSIS = await build_analysis(lookback=DEFAULT_LOOKBACK)
 
         await update.message.reply_text(
             render_analysis(LATEST_ANALYSIS, DEFAULT_LOOKBACK),
@@ -269,7 +266,7 @@ async def ultimos5_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     try:
-        analysis = build_analysis(lookback=5)
+        analysis = await build_analysis(lookback=5)
         await update.message.reply_text(
             render_analysis(analysis, 5),
             parse_mode=ParseMode.HTML,
@@ -284,7 +281,7 @@ async def ultimos10_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     try:
-        analysis = build_analysis(lookback=10)
+        analysis = await build_analysis(lookback=10)
         await update.message.reply_text(
             render_analysis(analysis, 10),
             parse_mode=ParseMode.HTML,
@@ -292,6 +289,10 @@ async def ultimos10_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as e:
         logger.exception("Erro no /ultimos10")
         await update.message.reply_text(f"❌ Erro ao gerar os jogos: {e}")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Erro não tratado:", exc_info=context.error)
 
 
 # =========================
@@ -308,9 +309,9 @@ def main() -> None:
     app.add_handler(CommandHandler("hoje", hoje_cmd))
     app.add_handler(CommandHandler("ultimos5", ultimos5_cmd))
     app.add_handler(CommandHandler("ultimos10", ultimos10_cmd))
+    app.add_error_handler(error_handler)
 
     tz = ZoneInfo(TZ_NAME)
-
     update_time = time(hour=UPDATE_HOUR, minute=UPDATE_MINUTE, tzinfo=tz)
     reminder_time = time(hour=REMINDER_HOUR, minute=REMINDER_MINUTE, tzinfo=tz)
 
