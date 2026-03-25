@@ -36,4 +36,4 @@ RUN playwright install chromium
 
 COPY . .
 
-CMD ["python", "test_scraper.py"]
+CMD ["python", "main.py"]
