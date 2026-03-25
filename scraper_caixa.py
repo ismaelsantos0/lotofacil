@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import List
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 LOTOFACIL_URL = "https://loterias.caixa.gov.br/Paginas/Lotofacil.aspx"
 
@@ -44,14 +44,14 @@ def _extract_dezenas_from_text(text: str) -> List[int]:
     return sorted(ordered[:15])
 
 
-def fetch_latest_results(limit: int = 5) -> List[ConcursoLotofacil]:
+async def fetch_latest_results(limit: int = 5) -> List[ConcursoLotofacil]:
     if limit < 1:
         raise ValueError("limit deve ser >= 1")
 
     results: List[ConcursoLotofacil] = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
@@ -61,32 +61,32 @@ def fetch_latest_results(limit: int = 5) -> List[ConcursoLotofacil]:
             ],
         )
 
-        page = browser.new_page(locale="pt-BR")
-        page.goto(LOTOFACIL_URL, wait_until="domcontentloaded", timeout=60000)
+        page = await browser.new_page(locale="pt-BR")
+        await page.goto(LOTOFACIL_URL, wait_until="domcontentloaded", timeout=60000)
 
         header_locator = page.get_by_text(
             re.compile(r"Resultado Concurso \d+ \(\d{2}/\d{2}/\d{4}\)")
         )
 
         try:
-            header_locator.first.wait_for(timeout=60000)
+            await header_locator.first.wait_for(timeout=60000)
         except PlaywrightTimeoutError:
-            browser.close()
+            await browser.close()
             raise CaixaScraperError(
                 "A página da CAIXA carregou, mas o cabeçalho do resultado não apareceu."
             )
 
         for i in range(limit):
-            header_text = header_locator.first.inner_text().strip()
+            header_text = (await header_locator.first.inner_text()).strip()
             numero, data = _parse_header(header_text)
 
-            body_text = page.locator("body").inner_text()
+            body_text = await page.locator("body").inner_text()
             dezenas = _extract_dezenas_from_text(body_text)
 
             current = ConcursoLotofacil(numero=numero, data=data, dezenas=dezenas)
 
             if results and results[-1].numero == current.numero:
-                browser.close()
+                await browser.close()
                 raise CaixaScraperError(
                     f"O site não avançou para o concurso anterior. Concurso repetido: {current.numero}"
                 )
@@ -97,13 +97,13 @@ def fetch_latest_results(limit: int = 5) -> List[ConcursoLotofacil]:
                 anterior_locator = page.get_by_text(re.compile(r"^\s*<\s*Anterior\s*$"))
 
                 try:
-                    anterior_locator.first.click(timeout=15000)
+                    await anterior_locator.first.click(timeout=15000)
                 except PlaywrightTimeoutError:
-                    browser.close()
+                    await browser.close()
                     raise CaixaScraperError("Não consegui clicar em 'Anterior'.")
 
                 try:
-                    page.wait_for_function(
+                    await page.wait_for_function(
                         """
                         (oldHeader) => {
                             const txt = document.body?.innerText || "";
@@ -114,11 +114,11 @@ def fetch_latest_results(limit: int = 5) -> List[ConcursoLotofacil]:
                         timeout=30000,
                     )
                 except PlaywrightTimeoutError:
-                    browser.close()
+                    await browser.close()
                     raise CaixaScraperError(
                         "Cliquei em 'Anterior', mas a página não atualizou para o concurso anterior."
                     )
 
-        browser.close()
+        await browser.close()
 
     return results
