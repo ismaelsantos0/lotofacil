@@ -8,9 +8,10 @@ from zoneinfo import ZoneInfo
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import Conflict
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-from scraper_caixa import fetch_latest_results
+from fetch_api import fetch_latest_results
 
 # =========================
 # CONFIG
@@ -109,10 +110,14 @@ class Analise:
 # LÓGICA
 # =========================
 async def build_analysis(lookback: int = 5) -> Analise:
-    raw_concursos = await fetch_latest_results(limit=lookback)
+    raw_concursos = fetch_latest_results(limit=lookback)
 
     concursos = [
-        Concurso(numero=c.numero, data=c.data, dezenas=sorted(c.dezenas))
+        Concurso(
+            numero=int(c["numero"]),
+            data=str(c["data"]),
+            dezenas=sorted([int(n) for n in c["dezenas"]]),
+        )
         for c in raw_concursos
     ]
 
@@ -126,7 +131,10 @@ async def build_analysis(lookback: int = 5) -> Analise:
             recency_score[dezena] += weight
 
     universo = list(range(1, 26))
-    ranking = sorted(universo, key=lambda n: (-freq[n], -recency_score[n], n))
+    ranking = sorted(
+        universo,
+        key=lambda n: (-freq[n], -recency_score[n], n)
+    )
 
     d1 = sorted(ranking[:10])
     d2 = sorted(ranking[10:15])
@@ -216,10 +224,11 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     add_subscriber(update.effective_chat.id)
     msg = (
         "✅ Você foi inscrito nos lembretes.\n\n"
-        "Comandos:\n"
+        "Comandos disponíveis:\n"
         "/hoje - gera os jogos com base atualizada\n"
         "/ultimos5 - força análise com 5 concursos\n"
         "/ultimos10 - força análise com 10 concursos\n"
+        "/atualizar - atualiza agora a base\n"
         "/status - mostra inscritos\n"
         "/stop - desativa lembretes"
     )
@@ -240,6 +249,20 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     total = len(list_subscribers())
     await update.message.reply_text(f"👥 Inscritos nos lembretes: {total}")
+
+
+async def atualizar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    global LATEST_ANALYSIS
+
+    if update.message is None:
+        return
+
+    try:
+        LATEST_ANALYSIS = await build_analysis(lookback=DEFAULT_LOOKBACK)
+        await update.message.reply_text("✅ Base atualizada com sucesso.")
+    except Exception as e:
+        logger.exception("Erro no /atualizar")
+        await update.message.reply_text(f"❌ Erro ao atualizar a base: {e}")
 
 
 async def hoje_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -291,7 +314,16 @@ async def ultimos10_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"❌ Erro ao gerar os jogos: {e}")
 
 
+async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message is None:
+        return
+    await update.message.reply_text("🏓 Pong")
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, Conflict):
+        logger.warning("Conflito temporário de polling detectado.")
+        return
     logger.exception("Erro não tratado:", exc_info=context.error)
 
 
@@ -306,9 +338,11 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("atualizar", atualizar_cmd))
     app.add_handler(CommandHandler("hoje", hoje_cmd))
     app.add_handler(CommandHandler("ultimos5", ultimos5_cmd))
     app.add_handler(CommandHandler("ultimos10", ultimos10_cmd))
+    app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_error_handler(error_handler)
 
     tz = ZoneInfo(TZ_NAME)
