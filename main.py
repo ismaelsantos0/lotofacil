@@ -27,6 +27,7 @@ UPDATE_MINUTE = int(os.getenv("UPDATE_MINUTE", "10"))
 REMINDER_HOUR = int(os.getenv("REMINDER_HOUR", "19"))
 REMINDER_MINUTE = int(os.getenv("REMINDER_MINUTE", "30"))
 
+# De quanto em quanto tempo o bot verifica se saiu resultado novo
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "1800"))
 
 DB_PATH = "bot.db"
@@ -41,7 +42,6 @@ logging.basicConfig(
 logger = logging.getLogger("lotofacil-bot")
 
 LATEST_ANALYSIS = None
-
 
 # =========================
 # DB
@@ -117,7 +117,7 @@ def save_prediction(chat_id: int, analysis: "Analise", lookback: int) -> int:
     }
 
     with get_conn() as conn:
-        # evita duplicar a mesma estratégia pendente para o mesmo chat/concurso/lookback
+        # evita duplicar previsão pendente igual para o mesmo concurso/chat
         conn.execute(
             """
             DELETE FROM predictions
@@ -129,7 +129,7 @@ def save_prediction(chat_id: int, analysis: "Analise", lookback: int) -> int:
             (chat_id, target_concurso, lookback),
         )
 
-        cur = conn.execute(
+        conn.execute(
             """
             INSERT INTO predictions (
                 chat_id,
@@ -149,7 +149,8 @@ def save_prediction(chat_id: int, analysis: "Analise", lookback: int) -> int:
             ),
         )
         conn.commit()
-        return target_concurso
+
+    return target_concurso
 
 
 def list_pending_predictions() -> list[sqlite3.Row]:
@@ -259,7 +260,10 @@ async def build_analysis(lookback: int = 5) -> Analise:
             recency_score[dezena] += weight
 
     universo = list(range(1, 26))
-    ranking = sorted(universo, key=lambda n: (-freq[n], -recency_score[n], n))
+    ranking = sorted(
+        universo,
+        key=lambda n: (-freq[n], -recency_score[n], n),
+    )
 
     d1 = sorted(ranking[:10])
     d2 = sorted(ranking[10:15])
@@ -289,6 +293,7 @@ async def build_analysis(lookback: int = 5) -> Analise:
 # FORMATAÇÃO
 # =========================
 FULLWIDTH_MAP = str.maketrans("0123456789", "０１２３４５６７８９")
+SEPARATOR = " • "
 
 
 def to_fullwidth(value: str) -> str:
@@ -304,12 +309,12 @@ def fmt_plain_num(n: int) -> str:
 
 
 def fmt_nums(nums: list[int]) -> str:
-    return " ".join(fmt_num(n) for n in nums)
+    return SEPARATOR.join(fmt_num(n) for n in nums)
 
 
-def fmt_nums_multiline(nums: list[int], first_line: int = 8) -> str:
-    line1 = " ".join(fmt_num(n) for n in nums[:first_line])
-    line2 = " ".join(fmt_num(n) for n in nums[first_line:])
+def fmt_nums_multiline(nums: list[int], first_line: int = 7) -> str:
+    line1 = SEPARATOR.join(fmt_num(n) for n in nums[:first_line])
+    line2 = SEPARATOR.join(fmt_num(n) for n in nums[first_line:])
     return f"{line1}\n{line2}"
 
 
@@ -317,7 +322,7 @@ def fmt_hits(nums: list[int], result_nums: list[int]) -> str:
     acertadas = sorted(set(nums) & set(result_nums))
     if not acertadas:
         return "—"
-    return " ".join(fmt_num(n) for n in acertadas)
+    return SEPARATOR.join(fmt_num(n) for n in acertadas)
 
 
 def render_analysis(a: Analise, lookback: int, target_concurso: int) -> str:
@@ -338,7 +343,12 @@ def render_analysis(a: Analise, lookback: int, target_concurso: int) -> str:
     )
 
 
-def render_result_check(prediction: sqlite3.Row, result_concurso: int, result_data: str, result_nums: list[int]) -> str:
+def render_result_check(
+    prediction: sqlite3.Row,
+    result_concurso: int,
+    result_data: str,
+    result_nums: list[int],
+) -> str:
     games = json.loads(prediction["games_json"])
 
     blocks = []
@@ -435,12 +445,14 @@ async def check_results_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 text=text,
                 parse_mode=ParseMode.HTML,
             )
+
             mark_prediction_checked(
                 prediction_id=int(prediction["id"]),
                 result_concurso=found["numero"],
                 result_data=found["data"],
                 result_dezenas=found["dezenas"],
             )
+
             logger.info(
                 "Conferência enviada para chat %s do concurso %s",
                 prediction["chat_id"],
@@ -512,6 +524,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     total = len(list_subscribers())
     pendentes = count_pending_predictions_for_chat(update.effective_chat.id)
+
     await update.message.reply_text(
         f"👥 Inscritos nos lembretes: {total}\n"
         f"🎟 Jogos pendentes de conferência neste chat: {pendentes}"
