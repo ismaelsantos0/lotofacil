@@ -1,9 +1,10 @@
+import json
 import logging
 import os
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass
-from datetime import time
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
 from telegram import Update
@@ -25,6 +26,8 @@ UPDATE_MINUTE = int(os.getenv("UPDATE_MINUTE", "10"))
 
 REMINDER_HOUR = int(os.getenv("REMINDER_HOUR", "19"))
 REMINDER_MINUTE = int(os.getenv("REMINDER_MINUTE", "30"))
+
+CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "1800"))
 
 DB_PATH = "bot.db"
 
@@ -58,6 +61,25 @@ def init_db() -> None:
             )
             """
         )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS predictions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                target_concurso INTEGER NOT NULL,
+                lookback INTEGER NOT NULL,
+                generated_at TEXT NOT NULL,
+                games_json TEXT NOT NULL,
+                checked INTEGER NOT NULL DEFAULT 0,
+                checked_at TEXT,
+                result_concurso INTEGER,
+                result_data TEXT,
+                result_dezenas TEXT
+            )
+            """
+        )
+
         conn.commit()
 
 
@@ -80,6 +102,112 @@ def list_subscribers() -> list[int]:
     with get_conn() as conn:
         rows = conn.execute("SELECT chat_id FROM subscribers").fetchall()
         return [int(r["chat_id"]) for r in rows]
+
+
+def save_prediction(chat_id: int, analysis: "Analise", lookback: int) -> int:
+    tz = ZoneInfo(TZ_NAME)
+    generated_at = datetime.now(tz).isoformat(timespec="seconds")
+    target_concurso = analysis.concursos[0].numero + 1
+
+    games = {
+        "J1": analysis.j1,
+        "J2": analysis.j2,
+        "J3": analysis.j3,
+        "J4": analysis.j4,
+    }
+
+    with get_conn() as conn:
+        # evita duplicar a mesma estratégia pendente para o mesmo chat/concurso/lookback
+        conn.execute(
+            """
+            DELETE FROM predictions
+            WHERE chat_id = ?
+              AND target_concurso = ?
+              AND lookback = ?
+              AND checked = 0
+            """,
+            (chat_id, target_concurso, lookback),
+        )
+
+        cur = conn.execute(
+            """
+            INSERT INTO predictions (
+                chat_id,
+                target_concurso,
+                lookback,
+                generated_at,
+                games_json
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                chat_id,
+                target_concurso,
+                lookback,
+                generated_at,
+                json.dumps(games, ensure_ascii=False),
+            ),
+        )
+        conn.commit()
+        return target_concurso
+
+
+def list_pending_predictions() -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM predictions
+            WHERE checked = 0
+            ORDER BY target_concurso ASC, id ASC
+            """
+        ).fetchall()
+        return rows
+
+
+def count_pending_predictions_for_chat(chat_id: int) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM predictions
+            WHERE chat_id = ?
+              AND checked = 0
+            """,
+            (chat_id,),
+        ).fetchone()
+        return int(row["total"] or 0)
+
+
+def mark_prediction_checked(
+    prediction_id: int,
+    result_concurso: int,
+    result_data: str,
+    result_dezenas: list[int],
+) -> None:
+    tz = ZoneInfo(TZ_NAME)
+    checked_at = datetime.now(tz).isoformat(timespec="seconds")
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE predictions
+            SET checked = 1,
+                checked_at = ?,
+                result_concurso = ?,
+                result_data = ?,
+                result_dezenas = ?
+            WHERE id = ?
+            """,
+            (
+                checked_at,
+                result_concurso,
+                result_data,
+                json.dumps(result_dezenas, ensure_ascii=False),
+                prediction_id,
+            ),
+        )
+        conn.commit()
 
 
 # =========================
@@ -116,7 +244,7 @@ async def build_analysis(lookback: int = 5) -> Analise:
         Concurso(
             numero=int(c["numero"]),
             data=str(c["data"]),
-            dezenas=sorted([int(n) for n in c["dezenas"]]),
+            dezenas=sorted(int(n) for n in c["dezenas"]),
         )
         for c in raw_concursos
     ]
@@ -131,10 +259,7 @@ async def build_analysis(lookback: int = 5) -> Analise:
             recency_score[dezena] += weight
 
     universo = list(range(1, 26))
-    ranking = sorted(
-        universo,
-        key=lambda n: (-freq[n], -recency_score[n], n)
-    )
+    ranking = sorted(universo, key=lambda n: (-freq[n], -recency_score[n], n))
 
     d1 = sorted(ranking[:10])
     d2 = sorted(ranking[10:15])
@@ -160,29 +285,85 @@ async def build_analysis(lookback: int = 5) -> Analise:
     )
 
 
+# =========================
+# FORMATAÇÃO
+# =========================
+FULLWIDTH_MAP = str.maketrans("0123456789", "０１２３４５６７８９")
+
+
+def to_fullwidth(value: str) -> str:
+    return value.translate(FULLWIDTH_MAP)
+
+
+def fmt_num(n: int) -> str:
+    return to_fullwidth(f"{n:02d}")
+
+
+def fmt_plain_num(n: int) -> str:
+    return f"{n:02d}"
+
+
 def fmt_nums(nums: list[int]) -> str:
-    return " ".join(f"{n:02d}" for n in nums)
+    return " ".join(fmt_num(n) for n in nums)
 
 
-def render_analysis(a: Analise, lookback: int) -> str:
-    concursos_txt = "\n".join(
-        f"• Concurso {c.numero} ({c.data}): {fmt_nums(c.dezenas)}"
-        for c in a.concursos
+def fmt_nums_multiline(nums: list[int], first_line: int = 8) -> str:
+    line1 = " ".join(fmt_num(n) for n in nums[:first_line])
+    line2 = " ".join(fmt_num(n) for n in nums[first_line:])
+    return f"{line1}\n{line2}"
+
+
+def fmt_hits(nums: list[int], result_nums: list[int]) -> str:
+    acertadas = sorted(set(nums) & set(result_nums))
+    if not acertadas:
+        return "—"
+    return " ".join(fmt_num(n) for n in acertadas)
+
+
+def render_analysis(a: Analise, lookback: int, target_concurso: int) -> str:
+    return (
+        f"🎯 <b>Lotofácil | Jogos do dia</b>\n\n"
+        f"📊 Base: <b>{fmt_num(lookback)}</b> concursos\n"
+        f"🔥 Quentes:\n"
+        f"{fmt_nums(a.d1)}\n\n\n"
+        f"🎟 <b>J1</b>\n"
+        f"{fmt_nums_multiline(a.j1)}\n\n\n"
+        f"🎟 <b>J2</b>\n"
+        f"{fmt_nums_multiline(a.j2)}\n\n\n"
+        f"🎟 <b>J3</b>\n"
+        f"{fmt_nums_multiline(a.j3)}\n\n\n"
+        f"🎟 <b>J4</b>\n"
+        f"{fmt_nums_multiline(a.j4)}\n\n"
+        f"🗂️ Conferência automática: concurso <b>{to_fullwidth(str(target_concurso))}</b>"
     )
 
+
+def render_result_check(prediction: sqlite3.Row, result_concurso: int, result_data: str, result_nums: list[int]) -> str:
+    games = json.loads(prediction["games_json"])
+
+    blocks = []
+    best_hits = 0
+
+    for name in ("J1", "J2", "J3", "J4"):
+        nums = sorted(int(n) for n in games[name])
+        hits = len(set(nums) & set(result_nums))
+        best_hits = max(best_hits, hits)
+
+        medal = "🏆" if hits >= 11 else "🎟"
+        blocks.append(
+            f"{medal} <b>{name}</b> — <b>{fmt_plain_num(hits)}</b> acertos\n"
+            f"{fmt_nums_multiline(nums)}\n"
+            f"✅ Acertadas: {fmt_hits(nums, result_nums)}"
+        )
+
+    resumo = "🚀 Bateu premiação!" if best_hits >= 11 else "📌 Resultado conferido"
+
     return (
-        f"🎯 <b>Lotofácil | Estratégia diária</b>\n"
-        f"Base usada: últimos <b>{lookback}</b> concursos\n\n"
-        f"<b>Concursos analisados</b>\n{concursos_txt}\n\n"
-        f"<b>D1</b> (10 mais quentes)\n{fmt_nums(a.d1)}\n\n"
-        f"<b>D2</b> (próximos 5)\n{fmt_nums(a.d2)}\n\n"
-        f"<b>D3</b> (próximos 5)\n{fmt_nums(a.d3)}\n\n"
-        f"<b>D4</b> (5 restantes)\n{fmt_nums(a.d4)}\n\n"
-        f"<b>Jogos gerados</b>\n"
-        f"J1 = D1 + D2\n{fmt_nums(a.j1)}\n\n"
-        f"J2 = D1 + D3\n{fmt_nums(a.j2)}\n\n"
-        f"J3 = D1 + D4\n{fmt_nums(a.j3)}\n\n"
-        f"J4 = D2 + D3 + D4\n{fmt_nums(a.j4)}"
+        f"{resumo}\n\n"
+        f"🎯 Concurso <b>{to_fullwidth(str(result_concurso))}</b> ({result_data})\n"
+        f"🔢 Resultado:\n"
+        f"{fmt_nums_multiline(result_nums)}\n\n"
+        + "\n\n".join(blocks)
     )
 
 
@@ -214,6 +395,88 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.exception("Erro ao enviar lembrete para %s: %s", chat_id, e)
 
 
+async def check_results_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending = list_pending_predictions()
+    if not pending:
+        return
+
+    try:
+        latest_results = fetch_latest_results(limit=15)
+    except Exception as e:
+        logger.exception("Erro ao buscar resultados para conferência: %s", e)
+        return
+
+    result_map: dict[int, dict] = {}
+    for item in latest_results:
+        numero = int(item["numero"])
+        result_map[numero] = {
+            "numero": numero,
+            "data": str(item["data"]),
+            "dezenas": sorted(int(n) for n in item["dezenas"]),
+        }
+
+    for prediction in pending:
+        target_concurso = int(prediction["target_concurso"])
+        found = result_map.get(target_concurso)
+
+        if not found:
+            continue
+
+        text = render_result_check(
+            prediction=prediction,
+            result_concurso=found["numero"],
+            result_data=found["data"],
+            result_nums=found["dezenas"],
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=int(prediction["chat_id"]),
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+            mark_prediction_checked(
+                prediction_id=int(prediction["id"]),
+                result_concurso=found["numero"],
+                result_data=found["data"],
+                result_dezenas=found["dezenas"],
+            )
+            logger.info(
+                "Conferência enviada para chat %s do concurso %s",
+                prediction["chat_id"],
+                target_concurso,
+            )
+        except Exception as e:
+            logger.exception(
+                "Erro ao enviar conferência para chat %s: %s",
+                prediction["chat_id"],
+                e,
+            )
+
+
+# =========================
+# ENVIO + SALVAMENTO
+# =========================
+async def send_analysis_and_store(
+    update: Update,
+    analysis: Analise,
+    lookback: int,
+) -> None:
+    if update.message is None or update.effective_chat is None:
+        return
+
+    target_concurso = save_prediction(
+        chat_id=update.effective_chat.id,
+        analysis=analysis,
+        lookback=lookback,
+    )
+
+    await update.message.reply_text(
+        render_analysis(analysis, lookback, target_concurso),
+        parse_mode=ParseMode.HTML,
+    )
+
+
 # =========================
 # COMANDOS
 # =========================
@@ -229,7 +492,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/ultimos5 - força análise com 5 concursos\n"
         "/ultimos10 - força análise com 10 concursos\n"
         "/atualizar - atualiza agora a base\n"
-        "/status - mostra inscritos\n"
+        "/status - mostra inscritos e pendências\n"
         "/stop - desativa lembretes"
     )
     await update.message.reply_text(msg)
@@ -244,11 +507,15 @@ async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message is None:
+    if update.message is None or update.effective_chat is None:
         return
 
     total = len(list_subscribers())
-    await update.message.reply_text(f"👥 Inscritos nos lembretes: {total}")
+    pendentes = count_pending_predictions_for_chat(update.effective_chat.id)
+    await update.message.reply_text(
+        f"👥 Inscritos nos lembretes: {total}\n"
+        f"🎟 Jogos pendentes de conferência neste chat: {pendentes}"
+    )
 
 
 async def atualizar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -275,10 +542,7 @@ async def hoje_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if LATEST_ANALYSIS is None:
             LATEST_ANALYSIS = await build_analysis(lookback=DEFAULT_LOOKBACK)
 
-        await update.message.reply_text(
-            render_analysis(LATEST_ANALYSIS, DEFAULT_LOOKBACK),
-            parse_mode=ParseMode.HTML,
-        )
+        await send_analysis_and_store(update, LATEST_ANALYSIS, DEFAULT_LOOKBACK)
     except Exception as e:
         logger.exception("Erro no /hoje")
         await update.message.reply_text(f"❌ Erro ao gerar os jogos: {e}")
@@ -290,10 +554,7 @@ async def ultimos5_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     try:
         analysis = await build_analysis(lookback=5)
-        await update.message.reply_text(
-            render_analysis(analysis, 5),
-            parse_mode=ParseMode.HTML,
-        )
+        await send_analysis_and_store(update, analysis, 5)
     except Exception as e:
         logger.exception("Erro no /ultimos5")
         await update.message.reply_text(f"❌ Erro ao gerar os jogos: {e}")
@@ -305,10 +566,7 @@ async def ultimos10_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         analysis = await build_analysis(lookback=10)
-        await update.message.reply_text(
-            render_analysis(analysis, 10),
-            parse_mode=ParseMode.HTML,
-        )
+        await send_analysis_and_store(update, analysis, 10)
     except Exception as e:
         logger.exception("Erro no /ultimos10")
         await update.message.reply_text(f"❌ Erro ao gerar os jogos: {e}")
@@ -366,12 +624,20 @@ def main() -> None:
         name="reminder_job",
     )
 
+    app.job_queue.run_repeating(
+        callback=check_results_job,
+        interval=CHECK_INTERVAL_SECONDS,
+        first=60,
+        name="check_results_job",
+    )
+
     logger.info(
-        "Bot iniciado. Atualização diária às %02d:%02d e lembrete às %02d:%02d (%s)",
+        "Bot iniciado. Atualização diária às %02d:%02d, lembrete às %02d:%02d e conferência a cada %s segundos (%s)",
         UPDATE_HOUR,
         UPDATE_MINUTE,
         REMINDER_HOUR,
         REMINDER_MINUTE,
+        CHECK_INTERVAL_SECONDS,
         TZ_NAME,
     )
 
