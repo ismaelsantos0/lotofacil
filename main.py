@@ -1,4 +1,3 @@
-import json
 import logging
 import math
 import os
@@ -308,13 +307,6 @@ def fmt_nums_multiline(nums: list[int], first_line: int = 7) -> str:
     line1 = SEPARATOR.join(fmt_num(n) for n in nums[:first_line])
     line2 = SEPARATOR.join(fmt_num(n) for n in nums[first_line:])
     return f"{line1}\n{line2}"
-
-
-def fmt_hits(nums: list[int], result_nums: list[int]) -> str:
-    acertadas = sorted(set(nums) & set(result_nums))
-    if not acertadas:
-        return "—"
-    return SEPARATOR.join(fmt_num(n) for n in acertadas)
 
 
 # =========================
@@ -732,10 +724,11 @@ async def build_analysis(lookback: int = 5) -> Analise:
         for c in raw_concursos
     ]
 
-    if len(all_concursos) < lookback:
-        raise RuntimeError(f"Concursos insuficientes para lookback={lookback}")
+    if not all_concursos:
+        raise RuntimeError("Nenhum concurso retornado pela API.")
 
-    concursos_exibicao = all_concursos[:lookback]
+    effective_lookback = min(lookback, len(all_concursos))
+    concursos_exibicao = all_concursos[:effective_lookback]
     last_result = all_concursos[0].dezenas
 
     freq5 = _build_freq_map(all_concursos, 5)
@@ -931,8 +924,6 @@ async def check_results_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         games = prediction["games_json"]
-        if isinstance(games, str):
-            games = json.loads(games)
 
         hits_json, best_hits = build_hits_json(games, found["dezenas"])
 
@@ -992,7 +983,7 @@ async def send_analysis_and_store(
     )
 
     await update.message.reply_text(
-        render_analysis(analysis, lookback, target_concurso),
+        render_analysis(analysis, len(analysis.concursos), target_concurso),
         parse_mode=ParseMode.HTML,
     )
 
