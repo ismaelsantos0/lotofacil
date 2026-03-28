@@ -725,7 +725,7 @@ async def build_analysis(lookback: int = 5) -> Analise:
     ]
 
     if not all_concursos:
-        raise RuntimeError("Nenhum concurso retornado pela API.")
+        raise RuntimeError("Nenhum concurso retornado pela API ou cache.")
 
     effective_lookback = min(lookback, len(all_concursos))
     concursos_exibicao = all_concursos[:effective_lookback]
@@ -833,7 +833,6 @@ def build_hits_json(games: dict, result_nums: list[int]) -> tuple[dict, int]:
 
 
 def render_result_check(
-    prediction: dict,
     result_concurso: int,
     result_data: str,
     result_nums: list[int],
@@ -924,11 +923,9 @@ async def check_results_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             continue
 
         games = prediction["games_json"]
-
         hits_json, best_hits = build_hits_json(games, found["dezenas"])
 
         text = render_result_check(
-            prediction=prediction,
             result_concurso=found["numero"],
             result_data=found["data"],
             result_nums=found["dezenas"],
