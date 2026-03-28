@@ -1,18 +1,26 @@
 import requests
 
-def fetch_latest_results(limit=5):
-    url = "https://loteriascaixa-api.herokuapp.com/api/lotofacil"
+API_URL = "https://servicebus2.caixa.gov.br/portaldeloterias/api/lotofacil"
 
-    response = requests.get(url, timeout=20)
-    data = response.json()
+def fetch_latest_results(limit: int = 30) -> list[dict]:
+    r = requests.get(API_URL, timeout=30)
+    r.raise_for_status()
+    data = r.json()
 
-    concursos = []
+    concursos = data if isinstance(data, list) else [data]
+    resultados = []
 
-    for item in data[:limit]:
-        concursos.append({
-            "numero": int(item["concurso"]),
-            "data": item["data"],
-            "dezenas": sorted([int(x) for x in item["dezenas"]])
-        })
+    for item in concursos[:limit]:
+        dezenas = item.get("listaDezenas") or item.get("dezenas") or []
+        numero = item.get("numero")
+        data_apuracao = item.get("dataApuracao") or item.get("data")
 
-    return concursos
+        resultados.append(
+            {
+                "numero": int(numero),
+                "data": str(data_apuracao),
+                "dezenas": [int(x) for x in dezenas],
+            }
+        )
+
+    return resultados
