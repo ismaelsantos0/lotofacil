@@ -1,11 +1,17 @@
 import json
 import logging
+import math
 import os
-import sqlite3
+import random
+import statistics
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, time
+from itertools import combinations
 from zoneinfo import ZoneInfo
+
+import psycopg2
+from psycopg2.extras import Json, RealDictCursor
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -18,6 +24,7 @@ from fetch_api import fetch_latest_results
 # CONFIG
 # =========================
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 TZ_NAME = os.getenv("TZ", "America/Boa_Vista")
 DEFAULT_LOOKBACK = int(os.getenv("DEFAULT_LOOKBACK", "5"))
 
@@ -27,13 +34,13 @@ UPDATE_MINUTE = int(os.getenv("UPDATE_MINUTE", "10"))
 REMINDER_HOUR = int(os.getenv("REMINDER_HOUR", "19"))
 REMINDER_MINUTE = int(os.getenv("REMINDER_MINUTE", "30"))
 
-# De quanto em quanto tempo o bot verifica se saiu resultado novo
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "1800"))
-
-DB_PATH = "bot.db"
 
 if not TOKEN:
     raise RuntimeError("Defina a variável de ambiente TELEGRAM_BOT_TOKEN")
+
+if not DATABASE_URL:
+    raise RuntimeError("Defina a variável de ambiente DATABASE_URL")
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -43,71 +50,98 @@ logger = logging.getLogger("lotofacil-bot")
 
 LATEST_ANALYSIS = None
 
+
 # =========================
 # DB
 # =========================
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 
 def init_db() -> None:
     with get_conn() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS subscribers (
-                chat_id INTEGER PRIMARY KEY
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subscribers (
+                    chat_id BIGINT PRIMARY KEY
+                )
+                """
             )
-            """
-        )
 
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS predictions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                target_concurso INTEGER NOT NULL,
-                lookback INTEGER NOT NULL,
-                generated_at TEXT NOT NULL,
-                games_json TEXT NOT NULL,
-                checked INTEGER NOT NULL DEFAULT 0,
-                checked_at TEXT,
-                result_concurso INTEGER,
-                result_data TEXT,
-                result_dezenas TEXT
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS predictions (
+                    id BIGSERIAL PRIMARY KEY,
+                    chat_id BIGINT NOT NULL,
+                    concurso_base INTEGER NOT NULL,
+                    target_concurso INTEGER NOT NULL,
+                    lookback INTEGER NOT NULL,
+                    generated_at TIMESTAMPTZ NOT NULL,
+                    games_json JSONB NOT NULL,
+                    checked BOOLEAN NOT NULL DEFAULT FALSE,
+                    checked_at TIMESTAMPTZ,
+                    result_concurso INTEGER,
+                    result_data TEXT,
+                    result_dezenas JSONB,
+                    hits_json JSONB,
+                    best_hits INTEGER
+                )
+                """
             )
-            """
-        )
+
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_predictions_pending
+                ON predictions (checked, target_concurso)
+                """
+            )
+
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_prediction_open
+                ON predictions (chat_id, target_concurso, lookback, checked)
+                WHERE checked = FALSE
+                """
+            )
 
         conn.commit()
 
 
 def add_subscriber(chat_id: int) -> None:
     with get_conn() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO subscribers (chat_id) VALUES (?)",
-            (chat_id,),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO subscribers (chat_id)
+                VALUES (%s)
+                ON CONFLICT (chat_id) DO NOTHING
+                """,
+                (chat_id,),
+            )
         conn.commit()
 
 
 def remove_subscriber(chat_id: int) -> None:
     with get_conn() as conn:
-        conn.execute("DELETE FROM subscribers WHERE chat_id = ?", (chat_id,))
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM subscribers WHERE chat_id = %s", (chat_id,))
         conn.commit()
 
 
 def list_subscribers() -> list[int]:
     with get_conn() as conn:
-        rows = conn.execute("SELECT chat_id FROM subscribers").fetchall()
-        return [int(r["chat_id"]) for r in rows]
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT chat_id FROM subscribers ORDER BY chat_id")
+            rows = cur.fetchall()
+            return [int(r["chat_id"]) for r in rows]
 
 
 def save_prediction(chat_id: int, analysis: "Analise", lookback: int) -> int:
     tz = ZoneInfo(TZ_NAME)
-    generated_at = datetime.now(tz).isoformat(timespec="seconds")
-    target_concurso = analysis.concursos[0].numero + 1
+    generated_at = datetime.now(tz)
+    concurso_base = analysis.concursos[0].numero
+    target_concurso = concurso_base + 1
 
     games = {
         "J1": analysis.j1,
@@ -117,67 +151,72 @@ def save_prediction(chat_id: int, analysis: "Analise", lookback: int) -> int:
     }
 
     with get_conn() as conn:
-        # evita duplicar previsão pendente igual para o mesmo concurso/chat
-        conn.execute(
-            """
-            DELETE FROM predictions
-            WHERE chat_id = ?
-              AND target_concurso = ?
-              AND lookback = ?
-              AND checked = 0
-            """,
-            (chat_id, target_concurso, lookback),
-        )
-
-        conn.execute(
-            """
-            INSERT INTO predictions (
-                chat_id,
-                target_concurso,
-                lookback,
-                generated_at,
-                games_json
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM predictions
+                WHERE chat_id = %s
+                  AND target_concurso = %s
+                  AND lookback = %s
+                  AND checked = FALSE
+                """,
+                (chat_id, target_concurso, lookback),
             )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                chat_id,
-                target_concurso,
-                lookback,
-                generated_at,
-                json.dumps(games, ensure_ascii=False),
-            ),
-        )
+
+            cur.execute(
+                """
+                INSERT INTO predictions (
+                    chat_id,
+                    concurso_base,
+                    target_concurso,
+                    lookback,
+                    generated_at,
+                    games_json
+                )
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    chat_id,
+                    concurso_base,
+                    target_concurso,
+                    lookback,
+                    generated_at,
+                    Json(games),
+                ),
+            )
         conn.commit()
 
     return target_concurso
 
 
-def list_pending_predictions() -> list[sqlite3.Row]:
+def list_pending_predictions() -> list[dict]:
     with get_conn() as conn:
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM predictions
-            WHERE checked = 0
-            ORDER BY target_concurso ASC, id ASC
-            """
-        ).fetchall()
-        return rows
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM predictions
+                WHERE checked = FALSE
+                ORDER BY target_concurso ASC, id ASC
+                """
+            )
+            return cur.fetchall()
 
 
 def count_pending_predictions_for_chat(chat_id: int) -> int:
     with get_conn() as conn:
-        row = conn.execute(
-            """
-            SELECT COUNT(*) AS total
-            FROM predictions
-            WHERE chat_id = ?
-              AND checked = 0
-            """,
-            (chat_id,),
-        ).fetchone()
-        return int(row["total"] or 0)
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM predictions
+                WHERE chat_id = %s
+                  AND checked = FALSE
+                """,
+                (chat_id,),
+            )
+            row = cur.fetchone()
+            return int(row["total"] or 0)
 
 
 def mark_prediction_checked(
@@ -185,29 +224,36 @@ def mark_prediction_checked(
     result_concurso: int,
     result_data: str,
     result_dezenas: list[int],
+    hits_json: dict,
+    best_hits: int,
 ) -> None:
     tz = ZoneInfo(TZ_NAME)
-    checked_at = datetime.now(tz).isoformat(timespec="seconds")
+    checked_at = datetime.now(tz)
 
     with get_conn() as conn:
-        conn.execute(
-            """
-            UPDATE predictions
-            SET checked = 1,
-                checked_at = ?,
-                result_concurso = ?,
-                result_data = ?,
-                result_dezenas = ?
-            WHERE id = ?
-            """,
-            (
-                checked_at,
-                result_concurso,
-                result_data,
-                json.dumps(result_dezenas, ensure_ascii=False),
-                prediction_id,
-            ),
-        )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE predictions
+                SET checked = TRUE,
+                    checked_at = %s,
+                    result_concurso = %s,
+                    result_data = %s,
+                    result_dezenas = %s,
+                    hits_json = %s,
+                    best_hits = %s
+                WHERE id = %s
+                """,
+                (
+                    checked_at,
+                    result_concurso,
+                    result_data,
+                    Json(result_dezenas),
+                    Json(hits_json),
+                    best_hits,
+                    prediction_id,
+                ),
+            )
         conn.commit()
 
 
@@ -233,60 +279,6 @@ class Analise:
     j2: list[int]
     j3: list[int]
     j4: list[int]
-
-
-# =========================
-# LÓGICA
-# =========================
-async def build_analysis(lookback: int = 5) -> Analise:
-    raw_concursos = fetch_latest_results(limit=lookback)
-
-    concursos = [
-        Concurso(
-            numero=int(c["numero"]),
-            data=str(c["data"]),
-            dezenas=sorted(int(n) for n in c["dezenas"]),
-        )
-        for c in raw_concursos
-    ]
-
-    freq = Counter()
-    recency_score = Counter()
-
-    for idx, concurso in enumerate(concursos):
-        weight = lookback - idx
-        for dezena in concurso.dezenas:
-            freq[dezena] += 1
-            recency_score[dezena] += weight
-
-    universo = list(range(1, 26))
-    ranking = sorted(
-        universo,
-        key=lambda n: (-freq[n], -recency_score[n], n),
-    )
-
-    d1 = sorted(ranking[:10])
-    d2 = sorted(ranking[10:15])
-    d3 = sorted(ranking[15:20])
-    d4 = sorted(ranking[20:25])
-
-    j1 = sorted(d1 + d2)
-    j2 = sorted(d1 + d3)
-    j3 = sorted(d1 + d4)
-    j4 = sorted(d2 + d3 + d4)
-
-    return Analise(
-        concursos=concursos,
-        ranking=ranking,
-        d1=d1,
-        d2=d2,
-        d3=d3,
-        d4=d4,
-        j1=j1,
-        j2=j2,
-        j3=j3,
-        j4=j4,
-    )
 
 
 # =========================
@@ -325,6 +317,491 @@ def fmt_hits(nums: list[int], result_nums: list[int]) -> str:
     return SEPARATOR.join(fmt_num(n) for n in acertadas)
 
 
+# =========================
+# MÉTRICAS
+# =========================
+def _normalize_map(values: dict[int, float], default: float = 0.5) -> dict[int, float]:
+    if not values:
+        return {}
+
+    vals = list(values.values())
+    vmin = min(vals)
+    vmax = max(vals)
+
+    if math.isclose(vmin, vmax):
+        return {k: default for k in values}
+
+    return {k: (v - vmin) / (vmax - vmin) for k, v in values.items()}
+
+
+def _build_freq_map(concursos: list[Concurso], window: int) -> dict[int, float]:
+    janela = concursos[: min(window, len(concursos))]
+    total = max(len(janela), 1)
+    freq = Counter()
+
+    for c in janela:
+        for n in c.dezenas:
+            freq[n] += 1
+
+    return {n: freq[n] / total for n in range(1, 26)}
+
+
+def _build_recency_map(concursos: list[Concurso], alpha: float = 0.87) -> dict[int, float]:
+    scores = {n: 0.0 for n in range(1, 26)}
+
+    for idx, c in enumerate(concursos):
+        peso = alpha ** idx
+        for n in c.dezenas:
+            scores[n] += peso
+
+    return _normalize_map(scores)
+
+
+def _build_delay_map(concursos: list[Concurso]) -> dict[int, float]:
+    atraso = {n: float(len(concursos) + 1) for n in range(1, 26)}
+
+    for idx, c in enumerate(concursos):
+        for n in c.dezenas:
+            if atraso[n] > len(concursos):
+                atraso[n] = float(idx)
+
+    return _normalize_map(atraso)
+
+
+def _build_zscore_map(concursos: list[Concurso], window: int = 30) -> dict[int, float]:
+    freq_map = _build_freq_map(concursos, window)
+    values = list(freq_map.values())
+
+    media = statistics.mean(values)
+    desvio = statistics.pstdev(values) or 1.0
+
+    zscores = {n: (freq_map[n] - media) / desvio for n in range(1, 26)}
+    return _normalize_map(zscores)
+
+
+def _build_trend_map(concursos: list[Concurso], window: int = 10) -> dict[int, float]:
+    janela = list(reversed(concursos[: min(window, len(concursos))]))
+    if len(janela) < 2:
+        return {n: 0.5 for n in range(1, 26)}
+
+    xs = list(range(len(janela)))
+    x_mean = statistics.mean(xs)
+    denom = sum((x - x_mean) ** 2 for x in xs) or 1.0
+
+    trend = {}
+    for n in range(1, 26):
+        ys = [1 if n in c.dezenas else 0 for c in janela]
+        y_mean = statistics.mean(ys)
+        numer = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+        trend[n] = numer / denom
+
+    return _normalize_map(trend)
+
+
+def _build_pair_map(concursos: list[Concurso], window: int = 20) -> dict[tuple[int, int], float]:
+    janela = concursos[: min(window, len(concursos))]
+    pair_count = Counter()
+
+    for c in janela:
+        dezenas = sorted(c.dezenas)
+        for a, b in combinations(dezenas, 2):
+            pair_count[(a, b)] += 1
+
+    if not pair_count:
+        return {}
+
+    max_v = max(pair_count.values()) or 1
+    return {k: v / max_v for k, v in pair_count.items()}
+
+
+def _historical_targets(concursos: list[Concurso]) -> tuple[float, float, int]:
+    sums = [sum(c.dezenas) for c in concursos[: min(30, len(concursos))]]
+    mean_sum = statistics.mean(sums) if sums else 195.0
+    std_sum = statistics.pstdev(sums) if len(sums) > 1 else 12.0
+
+    reps = []
+    limite = min(len(concursos) - 1, 20)
+    for i in range(max(0, limite)):
+        a = set(concursos[i].dezenas)
+        b = set(concursos[i + 1].dezenas)
+        reps.append(len(a & b))
+
+    target_rep = round(statistics.mean(reps)) if reps else 9
+    return mean_sum, (std_sum or 12.0), target_rep
+
+
+def _weighted_unique_sample(
+    pool: list[int],
+    weights_map: dict[int, float],
+    k: int,
+    rng: random.Random,
+) -> list[int]:
+    available = list(pool)
+    chosen = []
+
+    while available and len(chosen) < k:
+        weights = [max(weights_map.get(n, 0.1), 0.01) for n in available]
+        pick = rng.choices(available, weights=weights, k=1)[0]
+        chosen.append(pick)
+        available.remove(pick)
+
+    return chosen
+
+
+def _max_consecutive(nums: list[int]) -> int:
+    nums = sorted(nums)
+    if not nums:
+        return 0
+
+    best = 1
+    cur = 1
+
+    for a, b in zip(nums, nums[1:]):
+        if b == a + 1:
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 1
+
+    return best
+
+
+def _row_counts(nums: list[int]) -> list[int]:
+    rows = [0, 0, 0, 0, 0]
+    for n in nums:
+        idx = min((n - 1) // 5, 4)
+        rows[idx] += 1
+    return rows
+
+
+def _game_hard_ok(nums: list[int], last_result: list[int], mean_sum: float, std_sum: float) -> bool:
+    pares = sum(1 for n in nums if n % 2 == 0)
+    baixas = sum(1 for n in nums if n <= 13)
+    repetidas = len(set(nums) & set(last_result))
+    soma = sum(nums)
+    seq = _max_consecutive(nums)
+
+    return (
+        5 <= pares <= 10
+        and 5 <= baixas <= 10
+        and 5 <= repetidas <= 11
+        and mean_sum - (2.2 * std_sum) <= soma <= mean_sum + (2.2 * std_sum)
+        and seq <= 5
+    )
+
+
+def _game_score(
+    nums: list[int],
+    dezena_score: dict[int, float],
+    pair_map: dict[tuple[int, int], float],
+    last_result: list[int],
+    mean_sum: float,
+    std_sum: float,
+    target_rep: int,
+) -> float:
+    s = sum(dezena_score[n] for n in nums) * 100.0
+
+    pares = sum(1 for n in nums if n % 2 == 0)
+    baixas = sum(1 for n in nums if n <= 13)
+    soma = sum(nums)
+    repetidas = len(set(nums) & set(last_result))
+    seq = _max_consecutive(nums)
+    rows = _row_counts(nums)
+
+    if 6 <= pares <= 9:
+        s += 10
+    else:
+        s -= abs(7.5 - pares) * 3
+
+    if 6 <= baixas <= 9:
+        s += 10
+    else:
+        s -= abs(7.5 - baixas) * 3
+
+    dist_sum = abs(soma - mean_sum)
+    tol_sum = max(std_sum * 1.4, 10)
+    s += max(0.0, 12.0 - (dist_sum / tol_sum) * 12.0)
+
+    dist_rep = abs(repetidas - target_rep)
+    s += max(0.0, 10.0 - dist_rep * 3.0)
+
+    if seq <= 3:
+        s += 7
+    elif seq == 4:
+        s += 3
+    else:
+        s -= (seq - 4) * 5
+
+    row_bonus = 0.0
+    for c in rows:
+        if 1 <= c <= 4:
+            row_bonus += 1.5
+        elif c == 0 or c >= 5:
+            row_bonus -= 2.0
+    s += row_bonus
+
+    if pair_map:
+        pair_scores = [pair_map.get(tuple(sorted((a, b))), 0.0) for a, b in combinations(nums, 2)]
+        s += (sum(pair_scores) / len(pair_scores)) * 12.0
+
+    return s
+
+
+def _build_profile_weights(
+    profile: str,
+    base_score: dict[int, float],
+    freq5: dict[int, float],
+    freq15: dict[int, float],
+    trend: dict[int, float],
+    delay: dict[int, float],
+    zscore: dict[int, float],
+) -> dict[int, float]:
+    weights = {}
+
+    for n in range(1, 26):
+        if profile == "J1":
+            value = (
+                base_score[n] * 0.70
+                + freq5[n] * 0.15
+                + freq15[n] * 0.10
+                + zscore[n] * 0.05
+            )
+        elif profile == "J2":
+            value = (
+                base_score[n] * 0.70
+                + trend[n] * 0.10
+                + delay[n] * 0.05
+                + zscore[n] * 0.15
+            )
+        elif profile == "J3":
+            value = (
+                base_score[n] * 0.55
+                + trend[n] * 0.25
+                + freq5[n] * 0.10
+                + zscore[n] * 0.10
+            )
+        else:
+            cold_factor = 1.0 - freq15[n]
+            value = (
+                base_score[n] * 0.45
+                + delay[n] * 0.20
+                + trend[n] * 0.10
+                + cold_factor * 0.15
+                + zscore[n] * 0.10
+            )
+
+        weights[n] = max(value, 0.01)
+
+    return weights
+
+
+def _build_candidate_game(
+    profile: str,
+    ranking: list[int],
+    weights: dict[int, float],
+    rng: random.Random,
+) -> list[int]:
+    top = ranking[:9]
+    mid = ranking[9:17]
+    low = ranking[17:25]
+
+    if profile == "J1":
+        template = (8, 5, 2)
+    elif profile == "J2":
+        template = (7, 5, 3)
+    elif profile == "J3":
+        template = (6, 6, 3)
+    else:
+        template = (5, 6, 4)
+
+    a, b, c = template
+
+    chosen = (
+        _weighted_unique_sample(top, weights, a, rng)
+        + _weighted_unique_sample(mid, weights, b, rng)
+        + _weighted_unique_sample(low, weights, c, rng)
+    )
+
+    return sorted(chosen)
+
+
+def _select_games(
+    ranking: list[int],
+    base_score: dict[int, float],
+    freq5: dict[int, float],
+    freq15: dict[int, float],
+    trend: dict[int, float],
+    delay: dict[int, float],
+    zscore: dict[int, float],
+    pair_map: dict[tuple[int, int], float],
+    last_result: list[int],
+    mean_sum: float,
+    std_sum: float,
+    target_rep: int,
+    seed: int,
+) -> tuple[list[int], list[int], list[int], list[int]]:
+    profiles = ["J1", "J2", "J3", "J4"]
+    selected = []
+
+    for idx, profile in enumerate(profiles):
+        rng = random.Random(seed + idx * 1000)
+        weights = _build_profile_weights(profile, base_score, freq5, freq15, trend, delay, zscore)
+
+        best_game = None
+        best_score = -10**9
+
+        for _ in range(1200):
+            game = _build_candidate_game(profile, ranking, weights, rng)
+
+            if len(set(game)) != 15:
+                continue
+
+            if not _game_hard_ok(game, last_result, mean_sum, std_sum):
+                continue
+
+            too_close = False
+            for prev in selected:
+                if len(set(game) & set(prev)) > 11:
+                    too_close = True
+                    break
+            if too_close:
+                continue
+
+            score = _game_score(
+                nums=game,
+                dezena_score=base_score,
+                pair_map=pair_map,
+                last_result=last_result,
+                mean_sum=mean_sum,
+                std_sum=std_sum,
+                target_rep=target_rep,
+            )
+
+            if score > best_score:
+                best_score = score
+                best_game = game
+
+        if best_game is None:
+            for _ in range(500):
+                game = _build_candidate_game(profile, ranking, weights, rng)
+                if len(set(game)) != 15:
+                    continue
+
+                score = _game_score(
+                    nums=game,
+                    dezena_score=base_score,
+                    pair_map=pair_map,
+                    last_result=last_result,
+                    mean_sum=mean_sum,
+                    std_sum=std_sum,
+                    target_rep=target_rep,
+                )
+
+                if score > best_score:
+                    best_score = score
+                    best_game = game
+
+        if best_game is None:
+            if profile == "J1":
+                best_game = sorted(ranking[:15])
+            elif profile == "J2":
+                best_game = sorted(ranking[:10] + ranking[15:20])
+            elif profile == "J3":
+                best_game = sorted(ranking[:8] + ranking[10:17])
+            else:
+                best_game = sorted(ranking[5:20])
+
+        selected.append(best_game)
+
+    return selected[0], selected[1], selected[2], selected[3]
+
+
+# =========================
+# LÓGICA PRINCIPAL
+# =========================
+async def build_analysis(lookback: int = 5) -> Analise:
+    history_limit = max(lookback, 30)
+    raw_concursos = fetch_latest_results(limit=history_limit)
+
+    all_concursos = [
+        Concurso(
+            numero=int(c["numero"]),
+            data=str(c["data"]),
+            dezenas=sorted(int(n) for n in c["dezenas"]),
+        )
+        for c in raw_concursos
+    ]
+
+    if len(all_concursos) < lookback:
+        raise RuntimeError(f"Concursos insuficientes para lookback={lookback}")
+
+    concursos_exibicao = all_concursos[:lookback]
+    last_result = all_concursos[0].dezenas
+
+    freq5 = _build_freq_map(all_concursos, 5)
+    freq15 = _build_freq_map(all_concursos, 15)
+    freq30 = _build_freq_map(all_concursos, 30)
+    recency = _build_recency_map(all_concursos, alpha=0.87)
+    delay = _build_delay_map(all_concursos)
+    zscore = _build_zscore_map(all_concursos, window=30)
+    trend = _build_trend_map(all_concursos, window=10)
+    pair_map = _build_pair_map(all_concursos, window=20)
+
+    dezena_score = {}
+    for n in range(1, 26):
+        dezena_score[n] = (
+            (freq5[n] * 0.30)
+            + (freq15[n] * 0.20)
+            + (freq30[n] * 0.15)
+            + (recency[n] * 0.15)
+            + (zscore[n] * 0.10)
+            + (delay[n] * 0.05)
+            + (trend[n] * 0.05)
+        )
+
+    ranking = sorted(range(1, 26), key=lambda n: (-dezena_score[n], n))
+
+    d1 = sorted(ranking[:10])
+    d2 = sorted(ranking[10:15])
+    d3 = sorted(ranking[15:20])
+    d4 = sorted(ranking[20:25])
+
+    mean_sum, std_sum, target_rep = _historical_targets(all_concursos)
+    seed = all_concursos[0].numero
+
+    j1, j2, j3, j4 = _select_games(
+        ranking=ranking,
+        base_score=dezena_score,
+        freq5=freq5,
+        freq15=freq15,
+        trend=trend,
+        delay=delay,
+        zscore=zscore,
+        pair_map=pair_map,
+        last_result=last_result,
+        mean_sum=mean_sum,
+        std_sum=std_sum,
+        target_rep=target_rep,
+        seed=seed,
+    )
+
+    return Analise(
+        concursos=concursos_exibicao,
+        ranking=ranking,
+        d1=d1,
+        d2=d2,
+        d3=d3,
+        d4=d4,
+        j1=j1,
+        j2=j2,
+        j3=j3,
+        j4=j4,
+    )
+
+
+# =========================
+# RENDER
+# =========================
 def render_analysis(a: Analise, lookback: int, target_concurso: int) -> str:
     return (
         f"🎯 <b>Lotofácil | Jogos do dia</b>\n\n"
@@ -343,27 +820,48 @@ def render_analysis(a: Analise, lookback: int, target_concurso: int) -> str:
     )
 
 
-def render_result_check(
-    prediction: sqlite3.Row,
-    result_concurso: int,
-    result_data: str,
-    result_nums: list[int],
-) -> str:
-    games = json.loads(prediction["games_json"])
-
-    blocks = []
+def build_hits_json(games: dict, result_nums: list[int]) -> tuple[dict, int]:
+    hits_json = {}
     best_hits = 0
 
     for name in ("J1", "J2", "J3", "J4"):
         nums = sorted(int(n) for n in games[name])
-        hits = len(set(nums) & set(result_nums))
+        acertadas = sorted(set(nums) & set(result_nums))
+        hits = len(acertadas)
         best_hits = max(best_hits, hits)
 
+        hits_json[name] = {
+            "game": nums,
+            "hits": hits,
+            "matched_numbers": acertadas,
+        }
+
+    return hits_json, best_hits
+
+
+def render_result_check(
+    prediction: dict,
+    result_concurso: int,
+    result_data: str,
+    result_nums: list[int],
+    hits_json: dict,
+    best_hits: int,
+) -> str:
+    blocks = []
+
+    for name in ("J1", "J2", "J3", "J4"):
+        game_data = hits_json[name]
+        nums = game_data["game"]
+        hits = game_data["hits"]
+        acertadas = game_data["matched_numbers"]
+
         medal = "🏆" if hits >= 11 else "🎟"
+        acertadas_txt = "—" if not acertadas else SEPARATOR.join(fmt_num(n) for n in acertadas)
+
         blocks.append(
             f"{medal} <b>{name}</b> — <b>{fmt_plain_num(hits)}</b> acertos\n"
             f"{fmt_nums_multiline(nums)}\n"
-            f"✅ Acertadas: {fmt_hits(nums, result_nums)}"
+            f"✅ Acertadas: {acertadas_txt}"
         )
 
     resumo = "🚀 Bateu premiação!" if best_hits >= 11 else "📌 Resultado conferido"
@@ -411,12 +909,12 @@ async def check_results_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        latest_results = fetch_latest_results(limit=15)
+        latest_results = fetch_latest_results(limit=30)
     except Exception as e:
         logger.exception("Erro ao buscar resultados para conferência: %s", e)
         return
 
-    result_map: dict[int, dict] = {}
+    result_map = {}
     for item in latest_results:
         numero = int(item["numero"])
         result_map[numero] = {
@@ -432,11 +930,19 @@ async def check_results_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not found:
             continue
 
+        games = prediction["games_json"]
+        if isinstance(games, str):
+            games = json.loads(games)
+
+        hits_json, best_hits = build_hits_json(games, found["dezenas"])
+
         text = render_result_check(
             prediction=prediction,
             result_concurso=found["numero"],
             result_data=found["data"],
             result_nums=found["dezenas"],
+            hits_json=hits_json,
+            best_hits=best_hits,
         )
 
         try:
@@ -451,6 +957,8 @@ async def check_results_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 result_concurso=found["numero"],
                 result_data=found["data"],
                 result_dezenas=found["dezenas"],
+                hits_json=hits_json,
+                best_hits=best_hits,
             )
 
             logger.info(
